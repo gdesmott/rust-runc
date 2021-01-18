@@ -22,6 +22,7 @@ use crate::specs::{LinuxResources, Process};
 use chrono::{DateTime, Utc};
 use futures::ready;
 use futures::task::{Context, Poll};
+use futures::Stream;
 use log::warn;
 use serde::{Deserialize, Serialize};
 use snafu::{ensure, OptionExt, ResultExt, Snafu};
@@ -38,9 +39,8 @@ use tokio::io::BufReader;
 use tokio::macros::support::Pin;
 use tokio::process::Child;
 use tokio::process::Command;
-use tokio::stream::Stream;
-use tokio::stream::StreamExt;
 use tokio::time::timeout;
+use tokio_stream::wrappers::LinesStream;
 use uuid::Uuid;
 
 /// Container PTY terminal
@@ -78,7 +78,7 @@ pub enum Error {
     RuncCommandFailedError { stdout: String, stderr: String },
 
     #[snafu(display("Runc command timed out: {}", source))]
-    RuncCommandTimeoutError { source: tokio::time::Elapsed },
+    RuncCommandTimeoutError { source: tokio::time::error::Elapsed },
 
     #[snafu(display("Unable to parse runc version"))]
     RuncInvalidVersionError {},
@@ -790,10 +790,10 @@ struct ConsoleStream {
 
 impl ConsoleStream {
     fn new(mut process: Child, combined_output: bool) -> Result<Self, Error> {
-        let stdout = BufReader::new(process.stdout.take().unwrap()).lines();
+        let stdout = LinesStream::new(BufReader::new(process.stdout.take().unwrap()).lines());
         let inner: Pin<Box<dyn Stream<Item = tokio::io::Result<String>>>> = if combined_output {
-            let stderr = BufReader::new(process.stderr.take().unwrap()).lines();
-            Box::pin(stdout.merge(stderr))
+            let stderr = LinesStream::new(BufReader::new(process.stderr.take().unwrap()).lines());
+            Box::pin(futures::prelude::stream::select(stdout, stderr))
         } else {
             Box::pin(stdout)
         };
@@ -864,7 +864,7 @@ impl Stream for ConsoleStream {
 
 impl Drop for ConsoleStream {
     fn drop(&mut self) {
-        if let Err(e) = self.process.kill() {
+        if let Err(e) = self.process.start_kill() {
             warn!("failed to kill container: {}", e);
         }
     }
@@ -882,7 +882,7 @@ mod tests {
     use tar::Archive;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::runtime::Runtime;
-    use tokio::time::delay_for;
+    use tokio::time::sleep;
 
     #[test]
     fn test_create() {
@@ -942,7 +942,7 @@ mod tests {
             runc.state(&id).await
         };
 
-        let mut runtime = Runtime::new().expect("unable to create runtime");
+        let runtime = Runtime::new().expect("unable to create runtime");
         let container = runtime.block_on(task).expect("test failed");
 
         assert_eq!(container.status, Some(String::from("created")));
@@ -977,12 +977,12 @@ mod tests {
             .await?;
 
             runc.kill(&container.id, libc::SIGKILL, None).await?;
-            delay_for(Duration::from_millis(500)).await;
+            sleep(Duration::from_millis(500)).await;
             runc.delete(&container.id, None).await?;
             runc.list().await
         };
 
-        let mut runtime = Runtime::new().expect("unable to create runtime");
+        let runtime = Runtime::new().expect("unable to create runtime");
         let containers = runtime.block_on(task).expect("test failed");
 
         assert!(containers.is_empty());
@@ -1026,7 +1026,7 @@ mod tests {
             )
         };
 
-        let mut runtime = Runtime::new().expect("unable to create runtime");
+        let runtime = Runtime::new().expect("unable to create runtime");
         let events = runtime.block_on(task).expect("test failed");
 
         assert_eq!(events.len(), 3);
@@ -1169,13 +1169,13 @@ mod tests {
             )
             .await?;
 
-            delay_for(Duration::from_millis(500)).await;
+            sleep(Duration::from_millis(500)).await;
             let processes = runc.top(&id, None).await?;
             runc.kill(&id, libc::SIGKILL, None).await?;
             Ok::<_, Error>(processes)
         };
 
-        let mut runtime = Runtime::new().expect("unable to create runtime");
+        let runtime = Runtime::new().expect("unable to create runtime");
         let processes = runtime.block_on(task).expect("test failed");
 
         assert_ne!(
@@ -1219,11 +1219,11 @@ mod tests {
             .await?;
 
             runc.kill(&container.id, libc::SIGKILL, None).await?;
-            delay_for(Duration::from_millis(500)).await;
+            sleep(Duration::from_millis(500)).await;
             runc.state(&container.id).await
         };
 
-        let mut runtime = Runtime::new().expect("unable to create runtime");
+        let runtime = Runtime::new().expect("unable to create runtime");
         let state = runtime.block_on(task).expect("test failed");
 
         assert_eq!(state.status, Some(String::from("stopped")));
@@ -1278,7 +1278,7 @@ mod tests {
             ))
         };
 
-        let mut runtime = Runtime::new().expect("unable to create runtime");
+        let runtime = Runtime::new().expect("unable to create runtime");
         runtime.block_on(task).expect("test failed");
     }
 
@@ -1317,7 +1317,7 @@ mod tests {
             Ok::<_, Error>(container_state)
         };
 
-        let mut runtime = Runtime::new().expect("unable to create runtime");
+        let runtime = Runtime::new().expect("unable to create runtime");
         let container_state = runtime.block_on(task).expect("test failed");
 
         assert_eq!(container_state.status, Some(String::from("paused")));
@@ -1353,7 +1353,7 @@ mod tests {
             .unwrap();
 
             // Time for shell to spawn
-            delay_for(Duration::from_millis(100)).await;
+            sleep(Duration::from_millis(100)).await;
 
             let res = runc.ps(&container.id).await;
             if let Err(err) = res {
@@ -1383,7 +1383,7 @@ mod tests {
             }
         };
 
-        let mut runtime = Runtime::new().expect("unable to create runtime");
+        let runtime = Runtime::new().expect("unable to create runtime");
         runtime.block_on(task).expect("test failed");
     }
 
@@ -1425,7 +1425,7 @@ mod tests {
             runc.state(&container.id).await
         };
 
-        let mut runtime = Runtime::new().expect("unable to create runtime");
+        let runtime = Runtime::new().expect("unable to create runtime");
         let container = runtime.block_on(task).expect("test failed");
 
         assert_eq!(container.status, Some(String::from("running")));
@@ -1486,12 +1486,12 @@ mod tests {
             )
             .await?;
 
-            delay_for(Duration::from_millis(500)).await;
+            sleep(Duration::from_millis(500)).await;
 
             runc.state(&id).await
         };
 
-        let mut runtime = Runtime::new().expect("unable to create runtime");
+        let runtime = Runtime::new().expect("unable to create runtime");
         let container = runtime.block_on(task).expect("test failed");
 
         assert_eq!(container.status, Some(String::from("running")));
@@ -1554,14 +1554,14 @@ mod tests {
 
             runc.start(&id).await?;
 
-            delay_for(Duration::from_millis(500)).await;
+            sleep(Duration::from_millis(500)).await;
 
             let container_state = runc.state(&id).await?;
             runc.kill(&id, libc::SIGKILL, None).await?;
             Ok::<_, Error>(container_state)
         };
 
-        let mut runtime = Runtime::new().expect("unable to create runtime");
+        let runtime = Runtime::new().expect("unable to create runtime");
         let container = runtime.block_on(task).expect("test failed");
 
         assert_eq!(container.status, Some(String::from("running")));
@@ -1597,7 +1597,7 @@ mod tests {
             runc.state(&container.id).await
         };
 
-        let mut runtime = Runtime::new().expect("unable to create runtime");
+        let runtime = Runtime::new().expect("unable to create runtime");
         let state = runtime.block_on(task).expect("test failed");
 
         assert_eq!(state.status, Some(String::from("running")));
@@ -1651,7 +1651,7 @@ mod tests {
             ))
         };
 
-        let mut runtime = Runtime::new().expect("unable to create runtime");
+        let runtime = Runtime::new().expect("unable to create runtime");
         runtime.block_on(task).expect("test failed");
     }
 
@@ -1685,7 +1685,7 @@ mod tests {
             .unwrap();
 
             // Time for shell to spawn
-            delay_for(Duration::from_millis(100)).await;
+            sleep(Duration::from_millis(100)).await;
 
             let processes = runc
                 .top(&container.id, None)
@@ -1706,7 +1706,7 @@ mod tests {
             Ok::<_, io::Error>(())
         };
 
-        let mut runtime = Runtime::new().expect("unable to create runtime");
+        let runtime = Runtime::new().expect("unable to create runtime");
         runtime.block_on(task).expect("test failed");
     }
 
@@ -1792,7 +1792,7 @@ mod tests {
             runc.stats(&id).await
         };
 
-        let mut runtime = Runtime::new().expect("unable to create runtime");
+        let runtime = Runtime::new().expect("unable to create runtime");
         let stats = runtime.block_on(task).expect("test failed");
 
         if let Some(memory) = stats.memory {
@@ -1829,7 +1829,7 @@ mod tests {
         config.root = Some(runc_root);
         let runc = Runc::new(config).expect("Unable to create runc instance");
 
-        let mut runtime = Runtime::new().expect("unable to create runtime");
+        let runtime = Runtime::new().expect("unable to create runtime");
         let version = runtime.block_on(runc.version()).expect("test failed");
 
         assert_eq!(version.runc_version, Some(String::from("1.0.0-rc10")));
@@ -1893,7 +1893,7 @@ mod tests {
             Ok::<_, Error>(fd_receiver.await.unwrap())
         };
 
-        let mut runtime = Runtime::new().expect("unable to create runtime");
+        let runtime = Runtime::new().expect("unable to create runtime");
         let mut pty_master = runtime.block_on(task).expect("test failed");
 
         let task = async move {
@@ -1901,13 +1901,13 @@ mod tests {
             pty_master.read(&mut response).await?;
             pty_master.write(b"uname -a && exit\n").await?;
 
-            delay_for(Duration::from_millis(500)).await;
+            sleep(Duration::from_millis(500)).await;
 
             let len = pty_master.read(&mut response).await?;
             Ok::<_, io::Error>(String::from_utf8(Vec::from(&response[..len])).unwrap())
         };
 
-        let mut runtime = Runtime::new().expect("unable to create runtime");
+        let runtime = Runtime::new().expect("unable to create runtime");
         let response = runtime.block_on(task).expect("test failed");
 
         let response = match response

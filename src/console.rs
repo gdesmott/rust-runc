@@ -14,20 +14,19 @@
  * limitations under the License.
  */
 
+use futures::future::poll_fn;
 use std::ffi::c_void;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::io::FromRawFd;
 use std::path::PathBuf;
 use std::{fs, ptr};
-use tokio::future::poll_fn;
 
 use log::warn;
-use mio::Ready;
 use mio_uds::{UnixListener, UnixStream};
 use tokio::fs::File;
 
 use crate::*;
-use tokio::io::PollEvented;
+use tokio::io::unix::AsyncFd;
 
 /// Receive a PTY master over the provided unix socket
 pub struct ReceivePtyMaster {
@@ -49,10 +48,11 @@ impl ReceivePtyMaster {
 
     /// Receive a master PTY file descriptor from the socket
     pub async fn receive(mut self) -> Result<File, Error> {
-        let io = PollEvented::new(self.listener.take().unwrap()).unwrap();
-        poll_fn(|cx| io.poll_read_ready(cx, Ready::readable()))
+        let io = AsyncFd::new(self.listener.take().unwrap()).unwrap();
+        poll_fn(|cx| io.poll_read_ready(cx))
             .await
-            .unwrap();
+            .unwrap()
+            .retain_ready();
 
         let (console_stream, _) = io
             .get_ref()
@@ -60,12 +60,13 @@ impl ReceivePtyMaster {
             .context(UnixSocketConnectError {})?
             .unwrap();
         let console_stream =
-            PollEvented::new(UnixStream::from_stream(console_stream).unwrap()).unwrap();
+            AsyncFd::new(UnixStream::from_stream(console_stream).unwrap()).unwrap();
 
         loop {
-            poll_fn(|cx| console_stream.poll_read_ready(cx, Ready::readable()))
+            poll_fn(|cx| console_stream.poll_read_ready(cx))
                 .await
-                .unwrap();
+                .unwrap()
+                .retain_ready();
 
             {
                 // 4096 is the max name length from the go-runc implementation
